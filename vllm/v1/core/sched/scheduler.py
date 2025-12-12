@@ -232,6 +232,17 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # PERF: Cache frequently accessed attributes locally. schedule() is called
+        # in a tight engine loop and can run at high frequency.
+        scheduler_config = self.scheduler_config
+        kv_cache_manager = self.kv_cache_manager
+        encoder_cache_manager = self.encoder_cache_manager
+        max_model_len = self.max_model_len
+        policy = self.policy
+        use_eagle = self.use_eagle
+        num_lookahead_tokens = self.num_lookahead_tokens
+        long_prefill_threshold = scheduler_config.long_prefill_token_threshold
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -258,14 +269,14 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            if 0 < long_prefill_threshold < num_new_tokens:
+                num_new_tokens = long_prefill_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
             num_new_tokens = min(
-                num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
+                num_new_tokens, max_model_len - 1 - request.num_computed_tokens
             )
 
             # Schedule encoder inputs.
@@ -283,7 +294,7 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
+                    shift_computed_tokens=1 if use_eagle else 0,
                 )
 
             if num_new_tokens == 0:
@@ -305,10 +316,10 @@ class Scheduler(SchedulerInterface):
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
+                    new_blocks = kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=num_lookahead_tokens,
                     )
 
                     if new_blocks is not None:
@@ -317,12 +328,11 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
-                        preempted_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
-                        )
-                        self.running.remove(preempted_req)
+                    if policy == SchedulingPolicy.PRIORITY:
+                        # PERF: In PRIORITY mode, we keep `self.running` sorted
+                        # by (priority, arrival_time) so the lowest priority
+                        # (largest key) is the last element.
+                        preempted_req = self.running.pop()
                         if preempted_req in scheduled_running_reqs:
                             scheduled_running_reqs.remove(preempted_req)
                             token_budget += num_scheduled_tokens[
@@ -390,11 +400,11 @@ class Scheduler(SchedulerInterface):
                 )
                 # Allocate the encoder cache.
                 for i in encoder_inputs_to_schedule:
-                    self.encoder_cache_manager.allocate(request, i)
+                    encoder_cache_manager.allocate(request, i)
                 encoder_compute_budget = new_encoder_compute_budget
             if external_load_encoder_input:
                 for i in external_load_encoder_input:
-                    self.encoder_cache_manager.allocate(request, i)
+                    encoder_cache_manager.allocate(request, i)
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
 
@@ -467,7 +477,7 @@ class Scheduler(SchedulerInterface):
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(request)
+                        kv_cache_manager.get_computed_blocks(request)
                     )
 
                     # Get externally-cached tokens if using a KVConnector.
@@ -514,9 +524,8 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
-                        num_new_tokens = threshold
+                    if 0 < long_prefill_threshold < num_new_tokens:
+                        num_new_tokens = long_prefill_threshold
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -543,7 +552,7 @@ class Scheduler(SchedulerInterface):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
+                            shift_computed_tokens=1 if use_eagle else 0,
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
@@ -555,7 +564,7 @@ class Scheduler(SchedulerInterface):
                 # creates a mismatch between the number
                 # of local and remote blocks.
                 effective_lookahead_tokens = (
-                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+                    0 if request.num_computed_tokens == 0 else num_lookahead_tokens
                 )
 
                 # Determine if we need to allocate cross-attention blocks.
@@ -570,7 +579,7 @@ class Scheduler(SchedulerInterface):
                 else:
                     num_encoder_tokens = 0
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
+                new_blocks = kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens + num_external_computed_tokens,
                     num_new_local_computed_tokens,
@@ -607,7 +616,7 @@ class Scheduler(SchedulerInterface):
 
                 self._update_connector_prefix_cache_stats(request)
 
-                self.running.append(request)
+                self._add_to_running(request)
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -622,7 +631,7 @@ class Scheduler(SchedulerInterface):
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
                 req_to_new_blocks[request.request_id] = (
-                    self.kv_cache_manager.get_blocks(request.request_id)
+                    kv_cache_manager.get_blocks(request.request_id)
                 )
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
@@ -638,12 +647,12 @@ class Scheduler(SchedulerInterface):
                     )
                     # Allocate the encoder cache.
                     for i in encoder_inputs_to_schedule:
-                        self.encoder_cache_manager.allocate(request, i)
+                        encoder_cache_manager.allocate(request, i)
                     encoder_compute_budget = new_encoder_compute_budget
                 # Allocate for external load encoder cache
                 if external_load_encoder_input:
                     for i in external_load_encoder_input:
-                        self.encoder_cache_manager.allocate(request, i)
+                        encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
         # Put back any skipped requests at the head of the waiting queue
@@ -745,6 +754,28 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _add_to_running(self, request: Request) -> None:
+        """Add a request to the running list.
+
+        PERF: For PRIORITY scheduling, we keep `self.running` sorted by
+        (priority, arrival_time). This enables O(1) selection of the
+        lowest-priority request for preemption (tail of the list).
+        """
+        if self.policy != SchedulingPolicy.PRIORITY:
+            self.running.append(request)
+            return
+
+        key = (request.priority, request.arrival_time)
+        # Linear scan from the tail to avoid extra allocations. The list is
+        # capped by max_num_running_reqs (typically <= 1024).
+        i = len(self.running)
+        while i > 0:
+            r = self.running[i - 1]
+            if (r.priority, r.arrival_time) <= key:
+                break
+            i -= 1
+        self.running.insert(i, request)
 
     def _preempt_request(
         self,
@@ -1030,14 +1061,22 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        # PERF: This method runs once per model step. It can be called at high
+        # frequency and may handle up to O(1K) requests per step. Minimize
+        # attribute lookups inside the hot loop.
         sampled_token_ids = model_runner_output.sampled_token_ids
+        req_id_to_index = model_runner_output.req_id_to_index
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
-        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        scheduled_spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        requests = self.requests
+        max_model_len = self.max_model_len
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
@@ -1068,21 +1107,19 @@ class Scheduler(SchedulerInterface):
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # Skip requests that were recovered from KV load failure
                 continue
-            request = self.requests.get(req_id)
+            request = requests.get(req_id)
             if request is None:
                 # The request is already finished. This can happen if the
                 # request is aborted while the model is executing it (e.g.,
                 # in pipeline parallelism).
                 continue
 
-            req_index = model_runner_output.req_id_to_index[req_id]
+            req_index = req_id_to_index[req_id]
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
 
-            scheduled_spec_token_ids = (
-                scheduler_output.scheduled_spec_decode_tokens.get(req_id)
-            )
+            scheduled_spec_token_ids = scheduled_spec_decode_tokens.get(req_id)
             if scheduled_spec_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
@@ -1120,7 +1157,7 @@ class Scheduler(SchedulerInterface):
             pooler_output = None
             if pooler_outputs:
                 pooler_output = pooler_outputs[req_index]
-                stopped = check_stop(request, self.max_model_len, pooler_output)
+                stopped = check_stop(request, max_model_len, pooler_output)
 
             if stopped:
                 kv_transfer_params = self._free_request(request)
@@ -1242,12 +1279,13 @@ class Scheduler(SchedulerInterface):
         # a request is still being prefilled, we expect the model runner
         # to return empty token ids for the request.
         stopped = False
+        max_model_len = self.max_model_len
         for num_new, output_token_id in enumerate(new_token_ids, 1):
             request.append_output_token_ids(output_token_id)
 
             # Check for stop and update request state.
             # This must be called before we make the EngineCoreOutput.
-            stopped = check_stop(request, self.max_model_len)
+            stopped = check_stop(request, max_model_len)
             if stopped:
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
