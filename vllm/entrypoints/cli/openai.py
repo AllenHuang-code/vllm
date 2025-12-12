@@ -5,14 +5,13 @@ import argparse
 import os
 import signal
 import sys
-from typing import TYPE_CHECKING
-
-from openai import OpenAI
-from openai.types.chat import ChatCompletionMessageParam
+from typing import TYPE_CHECKING, Any
 
 from vllm.entrypoints.cli.types import CLISubcommand
 
 if TYPE_CHECKING:
+    from openai import OpenAI
+    from openai.types.chat import ChatCompletionMessageParam
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 else:
     FlexibleArgumentParser = argparse.ArgumentParser
@@ -26,8 +25,11 @@ def _register_signal_handlers():
     signal.signal(signal.SIGTSTP, signal_handler)
 
 
-def _interactive_cli(args: argparse.Namespace) -> tuple[str, OpenAI]:
+def _interactive_cli(args: argparse.Namespace) -> tuple[str, Any]:
     _register_signal_handlers()
+
+    # Import lazily so `vllm --help` works without optional deps installed.
+    from openai import OpenAI
 
     base_url = args.url
     api_key = args.api_key or os.environ.get("OPENAI_API_KEY", "EMPTY")
@@ -66,8 +68,8 @@ def _print_completion_stream(stream) -> str:
     return output
 
 
-def chat(system_prompt: str | None, model_name: str, client: OpenAI) -> None:
-    conversation: list[ChatCompletionMessageParam] = []
+def chat(system_prompt: str | None, model_name: str, client: Any) -> None:
+    conversation: list[Any] = []
     if system_prompt is not None:
         conversation.append({"role": "system", "content": system_prompt})
 
@@ -127,7 +129,7 @@ class ChatCommand(CLISubcommand):
     def cmd(args: argparse.Namespace) -> None:
         model_name, client = _interactive_cli(args)
         system_prompt = args.system_prompt
-        conversation: list[ChatCompletionMessageParam] = []
+        conversation: list[Any] = []
 
         if system_prompt is not None:
             conversation.append({"role": "system", "content": system_prompt})

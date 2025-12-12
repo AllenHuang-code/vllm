@@ -4,29 +4,9 @@
 import argparse
 import signal
 
-import uvloop
-
-import vllm
-import vllm.envs as envs
 from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.entrypoints.openai.api_server import (
-    run_server,
-    run_server_worker,
-    setup_server,
-)
-from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
-from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.utils.network_utils import get_tcp_uri
-from vllm.utils.system_utils import decorate_logs, set_process_title
-from vllm.v1.engine.core import EngineCoreProc
-from vllm.v1.engine.utils import CoreEngineProcManager, launch_core_engines
-from vllm.v1.executor import Executor
-from vllm.v1.executor.multiproc_executor import MultiprocExecutor
-from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
-from vllm.v1.utils import APIServerProcessManager, wait_for_completion_or_failure
 
 logger = init_logger(__name__)
 
@@ -46,6 +26,10 @@ class ServeSubcommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: argparse.Namespace) -> None:
+        import uvloop
+
+        from vllm.entrypoints.openai.api_server import run_server
+
         # If model is specified in CLI (as positional arg), it takes precedence
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
@@ -60,11 +44,16 @@ class ServeSubcommand(CLISubcommand):
                 uvloop.run(run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
+        from vllm.entrypoints.openai.cli_args import validate_parsed_serve_args
+
         validate_parsed_serve_args(args)
 
     def subparser_init(
         self, subparsers: argparse._SubParsersAction
     ) -> FlexibleArgumentParser:
+        from vllm.entrypoints.openai.cli_args import make_arg_parser
+        from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
+
         serve_parser = subparsers.add_parser(
             self.name, description=DESCRIPTION, usage="vllm serve [model_tag] [options]"
         )
@@ -79,6 +68,16 @@ def cmd_init() -> list[CLISubcommand]:
 
 
 def run_headless(args: argparse.Namespace):
+    import vllm
+    import vllm.envs as envs
+
+    from vllm.usage.usage_lib import UsageContext
+    from vllm.utils.network_utils import get_tcp_uri
+    from vllm.v1.engine.core import EngineCoreProc
+    from vllm.v1.engine.utils import CoreEngineProcManager
+    from vllm.v1.executor import Executor
+    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
     if args.api_server_count > 1:
         raise ValueError("api_server_count can't be set in headless mode")
 
@@ -160,6 +159,16 @@ def run_headless(args: argparse.Namespace):
 
 
 def run_multi_api_server(args: argparse.Namespace):
+    import vllm
+    import vllm.envs as envs
+
+    from vllm.entrypoints.openai.api_server import setup_server
+    from vllm.usage.usage_lib import UsageContext
+    from vllm.v1.engine.utils import launch_core_engines
+    from vllm.v1.executor import Executor
+    from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
+    from vllm.v1.utils import APIServerProcessManager, wait_for_completion_or_failure
+
     assert not args.headless
     num_api_servers: int = args.api_server_count
     assert num_api_servers > 0
@@ -237,6 +246,11 @@ def run_api_server_worker_proc(
     listen_address, sock, args, client_config=None, **uvicorn_kwargs
 ) -> None:
     """Entrypoint for individual API server worker processes."""
+    import uvloop
+
+    from vllm.entrypoints.openai.api_server import run_server_worker
+    from vllm.utils.system_utils import decorate_logs, set_process_title
+
     client_config = client_config or {}
     server_index = client_config.get("client_index", 0)
 

@@ -30,6 +30,17 @@ class BenchmarkSubcommand(CLISubcommand):
     def subparser_init(
         self, subparsers: argparse._SubParsersAction
     ) -> FlexibleArgumentParser:
+        # Import benchmark subcommands to register their classes.
+        # This is intentionally done here (not in `vllm.entrypoints.cli.__init__`)
+        # so importing unrelated CLI subcommands doesn't eagerly pull benchmark
+        # dependencies.
+        from vllm.entrypoints.cli.benchmark import (  # noqa: F401
+            latency as _latency,
+            serve as _serve,
+            sweep as _sweep,
+            throughput as _throughput,
+        )
+
         bench_parser = subparsers.add_parser(
             self.name,
             description=self.help,

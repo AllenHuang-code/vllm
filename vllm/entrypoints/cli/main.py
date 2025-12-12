@@ -14,21 +14,60 @@ logger = init_logger(__name__)
 
 
 def main():
-    import vllm.entrypoints.cli.benchmark.main
-    import vllm.entrypoints.cli.collect_env
-    import vllm.entrypoints.cli.openai
-    import vllm.entrypoints.cli.run_batch
-    import vllm.entrypoints.cli.serve
     from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-    CMD_MODULES = [
-        vllm.entrypoints.cli.openai,
-        vllm.entrypoints.cli.serve,
-        vllm.entrypoints.cli.benchmark.main,
-        vllm.entrypoints.cli.collect_env,
-        vllm.entrypoints.cli.run_batch,
-    ]
+    # Map subcommand -> module providing cmd_init().
+    #
+    # Keep this list in sync with actual CLI modules, but do NOT import them
+    # here: we build a lightweight top-level parser first, then import only the
+    # chosen subcommand's module to build the full parser.
+    SUBCOMMAND_MODULES: dict[str, str] = {
+        # openai client helpers
+        "chat": "vllm.entrypoints.cli.openai",
+        "complete": "vllm.entrypoints.cli.openai",
+        # serving
+        "serve": "vllm.entrypoints.cli.serve",
+        # benchmarks
+        "bench": "vllm.entrypoints.cli.benchmark.main",
+        # utilities
+        "collect-env": "vllm.entrypoints.cli.collect_env",
+        "run-batch": "vllm.entrypoints.cli.run_batch",
+    }
+
+    SUBCOMMAND_HELP: dict[str, str] = {
+        "serve": "Launch an OpenAI-compatible API server.",
+        "chat": "Chat with a running OpenAI-compatible server.",
+        "complete": "Request completions from a running API server.",
+        "bench": "Run benchmarks (throughput/latency/serve/sweep).",
+        "collect-env": "Collect environment information for debugging.",
+        "run-batch": "Run batch prompts and write results to file.",
+    }
+
+    def _build_full_parser_for_subcommand(subcmd: str):
+        from importlib import import_module
+
+        module_path = SUBCOMMAND_MODULES[subcmd]
+        cmd_module = import_module(module_path)
+
+        parser = FlexibleArgumentParser(
+            description="vLLM CLI",
+            epilog=VLLM_SUBCMD_PARSER_EPILOG.format(subcmd="[subcommand]"),
+        )
+        parser.add_argument(
+            "-v",
+            "--version",
+            action="version",
+            version=importlib.metadata.version("vllm"),
+        )
+        subparsers = parser.add_subparsers(required=True, dest="subparser")
+
+        cmds = {}
+        # cmd_init may return multiple commands (e.g. chat/complete).
+        for cmd in cmd_module.cmd_init():
+            cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
+            cmds[cmd.name] = cmd
+        return parser, cmds
 
     cli_env_setup()
 
@@ -48,31 +87,33 @@ def main():
                 "Unspecified platform detected, switching to CPU Platform instead."
             )
 
-    parser = FlexibleArgumentParser(
+    # Lightweight top-level parser: do NOT import subcommands yet.
+    top_parser = FlexibleArgumentParser(
         description="vLLM CLI",
         epilog=VLLM_SUBCMD_PARSER_EPILOG.format(subcmd="[subcommand]"),
     )
-    parser.add_argument(
+    top_parser.add_argument(
         "-v",
         "--version",
         action="version",
         version=importlib.metadata.version("vllm"),
     )
-    subparsers = parser.add_subparsers(required=False, dest="subparser")
-    cmds = {}
-    for cmd_module in CMD_MODULES:
-        new_cmds = cmd_module.cmd_init()
-        for cmd in new_cmds:
-            cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
-            cmds[cmd.name] = cmd
+    top_subparsers = top_parser.add_subparsers(required=False, dest="subparser")
+    for name in sorted(SUBCOMMAND_MODULES.keys()):
+        top_subparsers.add_parser(name, help=SUBCOMMAND_HELP.get(name, ""), add_help=False)
+
+    # Parse only to detect which subcommand is requested.
+    # Unknown args are intentionally tolerated; the full parser will handle them.
+    top_args, _ = top_parser.parse_known_args()
+    if top_args.subparser is None:
+        top_parser.print_help()
+        return
+
+    parser, cmds = _build_full_parser_for_subcommand(top_args.subparser)
     args = parser.parse_args()
     if args.subparser in cmds:
         cmds[args.subparser].validate(args)
-
-    if hasattr(args, "dispatch_function"):
-        args.dispatch_function(args)
-    else:
-        parser.print_help()
+    args.dispatch_function(args)
 
 
 if __name__ == "__main__":
